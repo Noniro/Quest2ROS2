@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import setup
 
 package_name = 'q2r2_bringup'
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,6 +28,8 @@ setup(
             'CheckTCPconnection = q2r2_bringup.CheckTCPconnection:main',
             'left_arm_controller = q2r2_bringup.left_arm_controller:main',
             'right_arm_controller = q2r2_bringup.right_arm_controller:main',
+            'motoman_sim_controller = q2r2_bringup.motoman_sim_controller:main',
+            'quest_pose_publisher = q2r2_bringup.quest_pose_publisher:main',
         ],
     },
 )
