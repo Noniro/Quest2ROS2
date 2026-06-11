@@ -30,6 +30,7 @@ setup(
             'right_arm_controller = q2r2_bringup.right_arm_controller:main',
             'motoman_sim_controller = q2r2_bringup.motoman_sim_controller:main',
             'quest_pose_publisher = q2r2_bringup.quest_pose_publisher:main',
+            'hc10dtp_teleop_controller = q2r2_bringup.hc10dtp_teleop_controller:main',
         ],
     },
 )
