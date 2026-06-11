@@ -9,7 +9,11 @@
 #   3. Which motion interface the cabinet actually exposes (topic vs
 #      follow_joint_trajectory action vs point-queue services).
 #
-# Usage:  ROS_DOMAIN_ID=<n> ./hw_preflight.sh
+# Usage:  ROS_DOMAIN_ID=69 ./hw_preflight.sh
+#
+# Project policy: OUR domain is 69 (PC + cabinet motoros2_config.yaml).
+# The coworker's HC10 lives on domain 0/default. If this script finds his
+# robot on 69, the cabinet configs are wrong — fix before any motion.
 
 set -u
 
@@ -30,7 +34,8 @@ ROBOT_NODES=$(echo "$NODES" | grep -ciE "motoman|motoros" || true)
 echo
 if [ "$ROBOT_NODES" -eq 0 ]; then
     echo "RESULT: no MotoROS2 node visible. Cabinet is off, not booted, or on a"
-    echo "        different ROS_DOMAIN_ID. Re-run with ROS_DOMAIN_ID=<n> to scan."
+    echo "        different ROS_DOMAIN_ID. Ours should be 69 (PC and cabinet"
+    echo "        motoros2_config.yaml). Re-run with ROS_DOMAIN_ID=<n> to scan."
     exit 1
 elif [ "$ROBOT_NODES" -gt 1 ]; then
     echo "!! STOP: MULTIPLE MotoROS2 nodes visible — the coworker's HC10 is on"
