@@ -142,8 +142,19 @@ class HC10DTPTeleopController(Node):
 
     def _init_ik_chain(self):
         try:
-            # Parse Xacro to URDF XML
-            support_dir = get_package_share_directory('motoman_hc10_support')
+            # The URDF can come from the team support package (standalone, used
+            # in the Teleoperation_Experiment workspace) or from the upstream
+            # Yaskawa support packages (LearnROS2 workspace) — same xacro file.
+            support_dir = None
+            for pkg in ('hc10dtp_b00_support', 'motoman_hc10_support'):
+                try:
+                    support_dir = get_package_share_directory(pkg)
+                    break
+                except Exception:
+                    continue
+            if support_dir is None:
+                raise RuntimeError(
+                    "Neither 'hc10dtp_b00_support' nor 'motoman_hc10_support' is installed")
             xacro_file = os.path.join(support_dir, 'urdf', 'hc10dtp_b00.xacro')
             self.get_logger().info(f"Loading Xacro: {xacro_file}")
             

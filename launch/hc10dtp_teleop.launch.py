@@ -8,6 +8,18 @@ from launch.substitutions import Command, PathJoinSubstitution, LaunchConfigurat
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+def _find_support_package():
+    # Team standalone package first, upstream Yaskawa support as fallback.
+    for pkg in ("hc10dtp_b00_support", "motoman_hc10_support"):
+        try:
+            get_package_share_directory(pkg)
+            return pkg
+        except Exception:
+            continue
+    raise RuntimeError(
+        "Neither 'hc10dtp_b00_support' nor 'motoman_hc10_support' is installed")
+
+
 def generate_launch_description():
     # Prepare environment for RViz (must carry over DISPLAY and other variables)
     rviz_env = dict(os.environ)
@@ -18,7 +30,7 @@ def generate_launch_description():
 
     # Path to hc10dtp xacro file
     xacro_file = PathJoinSubstitution([
-        FindPackageShare("motoman_hc10_support"),
+        FindPackageShare(_find_support_package()),
         "urdf",
         "hc10dtp_b00.xacro"
     ])
@@ -79,19 +91,20 @@ def generate_launch_description():
         }]
     )
 
-    # Node: RViz2
-    rviz_config_file = PathJoinSubstitution([
-        FindPackageShare("motoman_resources"),
-        "rviz",
-        "view_robot.rviz"
-    ])
-    
+    # Node: RViz2 (preset config is optional — motoman_resources is only
+    # present in the LearnROS2 workspace, not the team workspace)
+    try:
+        rviz_args = ["-d", os.path.join(
+            get_package_share_directory("motoman_resources"), "rviz", "view_robot.rviz")]
+    except Exception:
+        rviz_args = []
+
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
         name="rviz2",
         output="screen",
-        arguments=["-d", rviz_config_file],
+        arguments=rviz_args,
         condition=IfCondition(LaunchConfiguration('rviz')),
         env=rviz_env
     )
