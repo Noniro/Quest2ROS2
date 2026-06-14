@@ -7,6 +7,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, PathJoinSubstitution, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.parameter_descriptions import ParameterValue
 
 def _find_support_package():
     # Team standalone package first, upstream Yaskawa support as fallback.
@@ -42,7 +43,7 @@ def generate_launch_description():
         xacro_file
     ])
 
-    robot_description = {"robot_description": robot_description_content}
+    robot_description = {"robot_description": ParameterValue(robot_description_content, value_type=str)}
 
     # Declare launch arguments
     rviz_arg = DeclareLaunchArgument(

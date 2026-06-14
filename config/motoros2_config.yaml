@@ -1,0 +1,59 @@
+---
+# MotoROS2 configuration for YUVAL'S HC10DTP (teleoperation robot).
+#
+# Derived from the team template (hc10dtp_b00_support/config/motoros2_config.yaml)
+# with the teleop project's settings applied. THIS FILE LIVES ON THE CONTROLLER:
+# copy it (with the MotoROS2 .out runtime + INFORM job) to the YRC1000micro via
+# USB/SD in maintenance mode, and reboot after any change. Keeping this copy in
+# git is so we always know what the cabinet is running.
+#
+# Full list of tunables:
+# https://github.com/Yaskawa-Global/motoros2/blob/main/motoros2_config.yaml
+
+
+#-----------------------------------------------------------------------------
+# REQUIRED: IP and UDP port of the micro-ROS Agent running on the teleop PC.
+# MotoROS2 connects OUTBOUND to this address — set it to the static IP of the
+# PC's ethernet interface on the robot subnet (NOT the WiFi address).
+agent_ip_address: "192.168.1.110"   # <-- teleop PC, robot-side NIC
+agent_port_number: 8888
+
+
+#-----------------------------------------------------------------------------
+# DDS domain — PROJECT POLICY: this robot lives on domain 69.
+# The other HC10 in the lab uses the default domain (0); keeping ours on 69
+# makes the two cells mutually invisible. Must match ROS_DOMAIN_ID on the PC.
+ros_domain_id: 69
+
+
+#-----------------------------------------------------------------------------
+# Single-robot cell: no namespace.
+node_namespace: ""
+
+
+#-----------------------------------------------------------------------------
+# Joint names — must match the URDF (hc10dtp_b00_support uses Yaskawa axis
+# names; the teleop controller derives its names from the same URDF).
+joint_names:
+  - [joint_1_s, joint_2_l, joint_3_u, joint_4_r, joint_5_b, joint_6_t]
+
+
+#-----------------------------------------------------------------------------
+# Clock sync and safety behaviour.
+# stop_motion_on_disconnect is REQUIRED for teleop: if the PC/agent drops out
+# mid-stream, the robot stops instead of finishing stale points.
+sync_timeclock_with_agent: true
+stop_motion_on_disconnect: true
+
+
+#-----------------------------------------------------------------------------
+# TF comes from robot_state_publisher on the PC; don't publish a second tree.
+publish_tf: false
+
+
+#-----------------------------------------------------------------------------
+# QoS defaults expected by RViz2 and our controller (sensor-data subscriber).
+publisher_qos:
+  robot_status: sensor_data
+  joint_states: sensor_data
+  tf: default

@@ -12,6 +12,48 @@ import xacro
 from ament_index_python.packages import get_package_share_directory
 import tempfile
 import ikpy.chain
+import xml.etree.ElementTree as ET
+
+
+def derive_chain_spec(urdf_xml, base_link='base_link', tip_link='tool0'):
+    """Walk the URDF kinematic tree from base_link to tip_link and return
+    (base_elements, active_links_mask, joint_names) for ikpy.
+
+    Joint/link names differ between URDF sources (upstream Yaskawa uses
+    joint_1..joint_6; the team's hc10dtp_b00_support uses Yaskawa axis names
+    joint_1_s..joint_6_t, which also match the cabinet's MotoROS2 config), so
+    nothing about the chain may be hardcoded.
+    """
+    root = ET.fromstring(urdf_xml)
+    children = {}
+    for j in root.findall('joint'):
+        parent = j.find('parent').get('link')
+        child = j.find('child').get('link')
+        children.setdefault(parent, []).append((j.get('name'), j.get('type'), child))
+
+    def dfs(link, path):
+        if link == tip_link:
+            return path
+        for jname, jtype, child in children.get(link, []):
+            found = dfs(child, path + [(jname, jtype, child)])
+            if found is not None:
+                return found
+        return None
+
+    path = dfs(base_link, [])
+    if path is None:
+        raise RuntimeError(f"No kinematic path from '{base_link}' to '{tip_link}' in URDF")
+
+    base_elements = [base_link]
+    mask = [False]  # ikpy origin link
+    joint_names = []
+    for jname, jtype, child in path:
+        base_elements += [jname, child]
+        actuated = jtype in ('revolute', 'continuous', 'prismatic')
+        mask.append(actuated)
+        if actuated:
+            joint_names.append(jname)
+    return base_elements, mask, joint_names
 
 # --- Math Helpers ---
 def quaternion_to_matrix(q):
@@ -89,17 +131,10 @@ class HC10DTPTeleopController(Node):
         self.y_bounds = (self.get_parameter('y_min').value, self.get_parameter('y_max').value)
         self.z_bounds = (self.get_parameter('z_min').value, self.get_parameter('z_max').value)
 
-        # Define Joint Names for HC10DTP
-        self.joint_names = [
-            'joint_1',
-            'joint_2',
-            'joint_3',
-            'joint_4',
-            'joint_5',
-            'joint_6'
-        ]
-
-        # Initialize joint angles dictionary (defaults to 0.0)
+        # Load URDF dynamically & initialize ikpy chain. Joint names are
+        # derived from the URDF so they always match what robot_state_publisher
+        # and the cabinet's MotoROS2 expect (raises if the URDF is unusable).
+        self._init_ik_chain()
         self.current_joints = {name: 0.0 for name in self.joint_names}
 
         # VR State variables
@@ -111,9 +146,6 @@ class HC10DTPTeleopController(Node):
         self.robot_anchor_pos = None
         self.robot_anchor_ori_matrix = None
         self.last_pose_msg = None
-
-        # Load URDF dynamically & initialize ikpy chain
-        self._init_ik_chain()
 
         # VR Right Hand Subscribers (typically right hand matches single arm teleop)
         self.pose_sub = self.create_subscription(
@@ -165,32 +197,12 @@ class HC10DTPTeleopController(Node):
             with tempfile.NamedTemporaryFile(mode='w', suffix='.urdf', delete=False) as f:
                 f.write(urdf_xml)
                 self.temp_urdf_path = f.name
-            
-            # Chain elements from base_link to tool0
-            elements = [
-                "base_link",
-                "joint_1", "link_1",
-                "joint_2", "link_2",
-                "joint_3", "link_3",
-                "joint_4", "link_4",
-                "joint_5", "link_5",
-                "joint_6", "link_6",
-                "joint_6-flange", "flange",
-                "flange-tool0", "tool0"
-            ]
 
-            # Define active mask (fixed joints are set to False)
-            # Link index mapping:
-            # 0: Base link (fixed) -> False
-            # 1: joint_1 (revolute) -> True
-            # 2: joint_2 (revolute) -> True
-            # 3: joint_3 (revolute) -> True
-            # 4: joint_4 (revolute) -> True
-            # 5: joint_5 (revolute) -> True
-            # 6: joint_6 (revolute) -> True
-            # 7: joint_6-flange (fixed) -> False
-            # 8: flange-tool0 (fixed) -> False
-            mask = [False, True, True, True, True, True, True, False, False]
+            # Chain elements, active mask, and joint names all come from the
+            # URDF (handles both joint_1..6 and joint_1_s..joint_6_t naming).
+            elements, mask, self.joint_names = derive_chain_spec(urdf_xml)
+            # Chain-link index of each actuated joint (parallel to joint_names)
+            self.active_idx = [i for i, active in enumerate(mask) if active]
 
             self.chain = ikpy.chain.Chain.from_urdf_file(
                 self.temp_urdf_path,
@@ -198,17 +210,19 @@ class HC10DTPTeleopController(Node):
                 active_links_mask=mask
             )
 
-            self.get_logger().info("Successfully loaded HC10DTP IK Chain!")
+            self.get_logger().info(
+                f"Successfully loaded HC10DTP IK chain, joints: {self.joint_names}")
 
         except Exception as e:
             self.get_logger().error(f"Failed to initialize IK chain: {e}")
+            raise
 
     def _get_eef_pose(self):
         # FK of the internal joint state via the same ikpy chain used for IK,
         # so the anchor is always consistent with the solver (no TF dependency).
         q = [0.0] * len(self.chain.links)
-        for i, name in enumerate(self.joint_names):
-            q[i + 1] = self.current_joints[name]
+        for idx, name in zip(self.active_idx, self.joint_names):
+            q[idx] = self.current_joints[name]
         T = self.chain.forward_kinematics(q)
         return T[:3, 3].copy(), T[:3, :3].copy()
 
@@ -300,8 +314,8 @@ class HC10DTPTeleopController(Node):
 
         # 5. Solve IK using ikpy with temporal consistency (seeding with current joints)
         initial_q = [0.0] * len(self.chain.links)
-        for i, name in enumerate(self.joint_names):
-            initial_q[i + 1] = self.current_joints[name]
+        for idx, name in zip(self.active_idx, self.joint_names):
+            initial_q[idx] = self.current_joints[name]
 
         try:
             ik_q = self.chain.inverse_kinematics(
@@ -313,8 +327,8 @@ class HC10DTPTeleopController(Node):
 
             # 6. Apply software safety checks (velocity delta clamp)
             valid_solution = True
-            for i, name in enumerate(self.joint_names):
-                new_val = float(ik_q[i + 1])
+            for idx, name in zip(self.active_idx, self.joint_names):
+                new_val = float(ik_q[idx])
                 old_val = self.current_joints[name]
                 if abs(new_val - old_val) > self.max_joint_delta:
                     self.get_logger().warning(
@@ -326,8 +340,8 @@ class HC10DTPTeleopController(Node):
 
             if valid_solution:
                 # Update current joints dictionary
-                for i, name in enumerate(self.joint_names):
-                    self.current_joints[name] = float(ik_q[i + 1])
+                for idx, name in zip(self.active_idx, self.joint_names):
+                    self.current_joints[name] = float(ik_q[idx])
 
         except Exception as e:
             self.get_logger().warning(f"IK Solver failed to converge: {e}")
