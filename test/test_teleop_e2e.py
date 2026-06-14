@@ -42,6 +42,21 @@ class FakeQuest(Node):
             rclpy.spin_once(self, timeout_sec=0.02)
 
 
+def test_teleop_e2e():
+    """pytest entry point: run e2e sim test. Skips if the sim is not already running."""
+    import pytest
+    rclpy.init()
+    probe = rclpy.create_node('_e2e_probe')
+    try:
+        names = [n for n, _ in probe.get_node_names_and_namespaces()]
+    finally:
+        probe.destroy_node()
+        rclpy.shutdown()
+    if 'hc10dtp_teleop_controller' not in names:
+        pytest.skip("hc10dtp_teleop_controller not running — launch hc10dtp_sim first")
+    main()
+
+
 def main():
     rclpy.init()
     n = FakeQuest()

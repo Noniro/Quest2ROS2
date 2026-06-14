@@ -73,6 +73,21 @@ def run_roundtrip(pkg):
     return ok
 
 
+def test_ik_roundtrip():
+    """pytest entry point: run IK round-trip for every installed HC10DTP support package."""
+    import pytest
+    results = {}
+    for pkg in ('hc10dtp_b00_support', 'motoman_hc10_support'):
+        try:
+            get_package_share_directory(pkg)
+        except Exception:
+            continue
+        results[pkg] = run_roundtrip(pkg)
+    if not results:
+        pytest.skip("No HC10DTP support package installed")
+    assert all(results.values()), f"IK round-trip failed: {results}"
+
+
 def main():
     results = {}
     for pkg in ('hc10dtp_b00_support', 'motoman_hc10_support'):
