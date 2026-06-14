@@ -31,6 +31,8 @@ setup(
             'motoman_sim_controller = q2r2_bringup.motoman_sim_controller:main',
             'quest_pose_publisher = q2r2_bringup.quest_pose_publisher:main',
             'hc10dtp_teleop_controller = q2r2_bringup.hc10dtp_teleop_controller:main',
+            'ur10e_teleop_controller = q2r2_bringup.ur10e_teleop_controller:main',
+            'ur10e_data_collector = q2r2_bringup.ur10e_data_collector:main',
         ],
     },
 )
