@@ -2,3 +2,7 @@ q2r_bringup/__pycache__/.vs/
 *.vsidx
 *.suo
 *.user
+
+# Python bytecode
+**/__pycache__/
+*.pyc

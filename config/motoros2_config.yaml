@@ -16,7 +16,7 @@
 # MotoROS2 connects OUTBOUND to this address — set it to the static IP of the
 # PC's ethernet interface on the robot subnet (NOT the WiFi address).
 agent_ip_address: "192.168.1.110"   # <-- teleop PC, robot-side NIC
-agent_port_number: 8888
+agent_port_number: 9999
 
 
 #-----------------------------------------------------------------------------

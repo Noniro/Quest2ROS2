@@ -32,8 +32,7 @@ Optional args:
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
-                             ExecuteProcess, TimerAction)
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -51,9 +50,13 @@ def generate_launch_description():
                                             description='Path to calibration.yaml (leave empty for nominal kinematics)')
     rviz_arg = DeclareLaunchArgument('rviz', default_value='true')
     scale_arg = DeclareLaunchArgument('scale_factor', default_value='1.2')
+    headless_arg = DeclareLaunchArgument(
+        'headless_mode', default_value='true',
+        description='Send URScript directly (true) instead of waiting for External Control URCap (false)')
 
-    # UR driver — brings up ros2_control + joint_state_broadcaster +
-    # scaled_joint_trajectory_controller by default.
+    # UR driver — brings up ros2_control + joint_state_broadcaster.
+    # headless_mode=true sends the URScript directly via port 30001, so no
+    # pendant Play button is needed and the URCap timing race is avoided.
     ur_control = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([FindPackageShare('ur_robot_driver'), 'launch', 'ur_control.launch.py'])
@@ -62,24 +65,12 @@ def generate_launch_description():
             'ur_type':            'ur10e',
             'robot_ip':           LaunchConfiguration('robot_ip'),
             'launch_rviz':        'false',
-            'initial_joint_controller': 'scaled_joint_trajectory_controller',
+            'headless_mode':      LaunchConfiguration('headless_mode'),
+            'initial_joint_controller': 'forward_position_controller',
+            'reverse_ip':         '192.168.1.202',
         }.items(),
     )
 
-    # Switch to forward_position_controller after the driver is up (5 s grace).
-    # This deactivates the trajectory controller and activates position streaming.
-    switch_controllers = TimerAction(
-        period=5.0,
-        actions=[ExecuteProcess(
-            cmd=[
-                'ros2', 'control', 'switch_controllers',
-                '--activate',   'forward_position_controller',
-                '--deactivate', 'scaled_joint_trajectory_controller',
-                '--controller-manager', '/controller_manager',
-            ],
-            output='screen',
-        )]
-    )
 
     tcp_endpoint = Node(
         package='ros_tcp_endpoint',
@@ -116,9 +107,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        robot_ip_arg, kinematics_arg, rviz_arg, scale_arg,
+        robot_ip_arg, kinematics_arg, rviz_arg, scale_arg, headless_arg,
         ur_control,
-        switch_controllers,
         tcp_endpoint,
         teleop_controller,
         rviz,
