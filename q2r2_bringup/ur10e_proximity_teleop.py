@@ -165,6 +165,10 @@ class UR10eProximityTeleop(Node):
         # Sanity guard: a single-tick raw IK jump bigger than this means an
         # IK/singularity flip (not real motion) — hold rather than chase it.
         self.declare_parameter('max_ik_jump',          1.0)
+        # Output smoothing — exponential moving average (1st-order low-pass).
+        # published = alpha*raw + (1-alpha)*previous. 1.0 = off (raw, jittery),
+        # lower = smoother (less tremor/noise, slightly more lag). Live-tunable.
+        self.declare_parameter('smoothing_alpha',      0.5)
         self.declare_parameter('disengage_fail_count', 15)
         self.declare_parameter('home_speed_deg_s',     8.0)   # °/s toward home
         # Position + orientation axis maps (Quest -> robot), tunable live.
@@ -181,6 +185,7 @@ class UR10eProximityTeleop(Node):
         self.rate       = self.get_parameter('publish_rate').value
         self.max_delta  = self.get_parameter('max_joint_delta').value
         self.max_ik_jump = self.get_parameter('max_ik_jump').value
+        self.smooth_a   = float(self.get_parameter('smoothing_alpha').value)
         self.fail_max   = self.get_parameter('disengage_fail_count').value
         home_deg_s      = self.get_parameter('home_speed_deg_s').value
         self.home_step  = np.radians(home_deg_s) / self.rate   # rad per tick
@@ -206,6 +211,9 @@ class UR10eProximityTeleop(Node):
         self.tcp_anchor       = None
         self.rot_anchor       = None
         self.quest_rot_anchor = None
+
+        # Smoothed output command (EMA state); reset on each engage.
+        self.cmd_filtered   = None
 
         self.last_quest_msg = None
         self.js_received    = self.sim_mode   # sim: current_joints already valid
@@ -337,6 +345,17 @@ class UR10eProximityTeleop(Node):
             elif p.name == 'max_ik_jump':
                 self.max_ik_jump = p.value
                 self.get_logger().info(f'[max_ik_jump] -> {p.value}')
+            elif p.name == 'smoothing_alpha':
+                a = float(p.value)
+                if not 0.0 < a <= 1.0:
+                    self.get_logger().error(
+                        f'[smoothing_alpha] rejected: {a} (must be in (0, 1])')
+                    return SetParametersResult(
+                        successful=False, reason='smoothing_alpha must be in (0, 1]')
+                self.smooth_a = a
+                self.get_logger().info(
+                    f'[smoothing_alpha] -> {a} '
+                    f'({"off" if a >= 1.0 else "smoothing on"})')
         return SetParametersResult(successful=True)
 
     # ── Services ─────────────────────────────────────────────────────────
@@ -424,6 +443,7 @@ class UR10eProximityTeleop(Node):
                 self.rot_anchor       = tcp_rot.copy()
                 self.quest_rot_anchor = q_rot.copy()
                 self.fail_count       = 0
+                self.cmd_filtered     = None   # re-seed smoothing on engage
                 self.get_logger().info(
                     f'[A] ENGAGED — anchor TCP: {np.round(tcp_pos, 3)}')
             else:
@@ -594,8 +614,22 @@ class UR10eProximityTeleop(Node):
             msg.position     = [self.current_joints[n] for n in self.joint_names]
             self.js_pub.publish(msg)
         elif self.state in (ENGAGED, HOMING):
+            raw = [self.current_joints[n] for n in self.joint_names]
+            # EMA low-pass on the teleop command to kill tremor/tracking jitter.
+            # Skip during HOMING (its ramp is already smooth) and when alpha>=1.
+            if self.state == ENGAGED and self.smooth_a < 1.0:
+                a = self.smooth_a
+                if self.cmd_filtered is None:
+                    self.cmd_filtered = list(raw)       # seed = current pose, no jump
+                else:
+                    self.cmd_filtered = [a * r + (1.0 - a) * f
+                                         for r, f in zip(raw, self.cmd_filtered)]
+                out = self.cmd_filtered
+            else:
+                self.cmd_filtered = None                 # reset so re-engage re-seeds
+                out = raw
             cmd = Float64MultiArray()
-            cmd.data = [self.current_joints[n] for n in self.joint_names]
+            cmd.data = out
             self.cmd_pub.publish(cmd)
 
     def __del__(self):
