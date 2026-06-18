@@ -157,7 +157,14 @@ class UR10eProximityTeleop(Node):
         self.declare_parameter('sim_mode',             True)
         self.declare_parameter('scale_factor',         1.0)
         self.declare_parameter('publish_rate',         30.0)
-        self.declare_parameter('max_joint_delta',      0.10)
+        # Per-tick joint rate limit (rad/tick). IK steps are CLAMPED to this so
+        # fast hand moves make the robot trail smoothly & catch up — instead of
+        # sending a violating step or disengaging. At publish_rate Hz the joint
+        # speed cap is max_joint_delta * publish_rate rad/s.
+        self.declare_parameter('max_joint_delta',      0.05)
+        # Sanity guard: a single-tick raw IK jump bigger than this means an
+        # IK/singularity flip (not real motion) — hold rather than chase it.
+        self.declare_parameter('max_ik_jump',          1.0)
         self.declare_parameter('disengage_fail_count', 15)
         self.declare_parameter('home_speed_deg_s',     8.0)   # °/s toward home
         # Position + orientation axis maps (Quest -> robot), tunable live.
@@ -173,6 +180,7 @@ class UR10eProximityTeleop(Node):
         self.scale      = self.get_parameter('scale_factor').value
         self.rate       = self.get_parameter('publish_rate').value
         self.max_delta  = self.get_parameter('max_joint_delta').value
+        self.max_ik_jump = self.get_parameter('max_ik_jump').value
         self.fail_max   = self.get_parameter('disengage_fail_count').value
         home_deg_s      = self.get_parameter('home_speed_deg_s').value
         self.home_step  = np.radians(home_deg_s) / self.rate   # rad per tick
@@ -321,6 +329,14 @@ class UR10eProximityTeleop(Node):
             elif p.name == 'scale_factor':
                 self.scale = p.value
                 self.get_logger().info(f'[scale_factor] -> {p.value}')
+            elif p.name == 'max_joint_delta':
+                self.max_delta = p.value
+                self.get_logger().info(
+                    f'[max_joint_delta] -> {p.value} '
+                    f'(~{np.degrees(p.value * self.rate):.0f}°/s cap)')
+            elif p.name == 'max_ik_jump':
+                self.max_ik_jump = p.value
+                self.get_logger().info(f'[max_ik_jump] -> {p.value}')
         return SetParametersResult(successful=True)
 
     # ── Services ─────────────────────────────────────────────────────────
@@ -432,20 +448,26 @@ class UR10eProximityTeleop(Node):
                     orientation_mode='all',
                     initial_position=q_seed)
 
-                bad = False
-                for idx, nm in zip(self.active_idx, self.joint_names):
-                    delta = abs(float(ik[idx]) - self.current_joints[nm])
-                    if delta > self.max_delta:
-                        self.get_logger().warning(
-                            f'[SAFETY] {nm} Δ={delta:.3f} rad > {self.max_delta:.3f}')
-                        bad = True; break
+                # Sanity guard: a huge single-tick raw jump = IK/singularity
+                # flip, not real motion. Hold this tick rather than chase it.
+                raw_max = max(
+                    abs(float(ik[idx]) - self.current_joints[nm])
+                    for idx, nm in zip(self.active_idx, self.joint_names))
 
-                if bad:
+                if raw_max > self.max_ik_jump:
+                    self.get_logger().warning(
+                        f'[IK-JUMP] {raw_max:.2f} rad > {self.max_ik_jump:.2f} '
+                        '(likely singularity) — holding')
                     self.fail_count += 1
                 else:
+                    # Rate-limit: step each joint at most max_delta toward the
+                    # target. Fast hand moves make the robot TRAIL smoothly and
+                    # catch up — no violating step, no disengage.
                     self.fail_count = 0
                     for idx, nm in zip(self.active_idx, self.joint_names):
-                        self.current_joints[nm] = float(ik[idx])
+                        step = float(ik[idx]) - self.current_joints[nm]
+                        step = float(np.clip(step, -self.max_delta, self.max_delta))
+                        self.current_joints[nm] += step
 
             except Exception as e:
                 self.get_logger().warning(f'[IK] {e}')
@@ -454,7 +476,7 @@ class UR10eProximityTeleop(Node):
             if self.fail_count >= self.fail_max:
                 self.state = IDLE
                 self.get_logger().warn(
-                    f'[DISENGAGED] {self.fail_count} IK/safety failures → IDLE')
+                    f'[DISENGAGED] {self.fail_count} IK/singularity failures → IDLE')
 
         # Log state transitions
         if self.state != prev_state:

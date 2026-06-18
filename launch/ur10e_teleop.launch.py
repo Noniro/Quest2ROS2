@@ -110,6 +110,11 @@ def generate_launch_description():
         robot_ip_arg, kinematics_arg, rviz_arg, scale_arg, headless_arg,
         ur_control,
         tcp_endpoint,
-        teleop_controller,
+        # NOTE: the legacy ur10e_teleop_controller is intentionally NOT launched.
+        # The current teleop node is ur10e_proximity_teleop, started separately
+        # (`ros2 run q2r2_bringup ur10e_proximity_teleop ...`). Launching the
+        # legacy controller here makes two nodes fight for
+        # /forward_position_controller/commands and the same Quest buttons.
+        # teleop_controller,
         rviz,
     ])
