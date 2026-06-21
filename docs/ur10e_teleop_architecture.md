@@ -110,11 +110,12 @@ When the full HW teleop is running, these processes are alive at once. Run
 | **forward_position_controller** | the driver (a controller) | Receives your `/...commands`, forwards them to the robot as position targets. |
 | **robot_state_publisher** | launch (sim) | Turns the URDF + joint angles into TF frames so RViz can draw the arm. |
 | **rviz2** | launch | Visualization only. Draws the robot model + your `/teleop_markers`. |
-| **ur10e_teleop_controller** (LEGACY) | `ur10e_start.sh`'s launch | ⚠️ An *old* teleop node we don't use. It also publishes joint commands → fights our node. **We kill it.** |
 
-> ⚠️ This is why Terminal 2 exists: the driver launch *also* spawns the legacy
-> controller, and two nodes publishing to `/forward_position_controller/commands`
-> would fight. We `kill -9` the legacy one; the driver itself survives.
+> 📌 **Historical note:** earlier versions of `ur10e_teleop.launch.py` also spawned
+> an *old* `ur10e_teleop_controller` node, which fought our node for
+> `/forward_position_controller/commands` and had to be killed by hand. It has been
+> **removed from the launch** (commit `e85badd`), so there's nothing to kill — only
+> `ur10e_proximity_teleop` ever commands the robot now.
 
 ---
 
@@ -151,7 +152,7 @@ Step by step, this script:
      then `brake release` → wait for RUNNING. Now the arm is energized.
 3. Runs `ros2 launch q2r2_bringup ur10e_teleop.launch.py headless_mode:=false`,
    which starts: the **UR driver** (with `forward_position_controller` as the
-   initial controller), the **TCP endpoint**, the **legacy controller**, and rviz.
+   initial controller), the **TCP endpoint**, and rviz.
 4. Waits for the driver's **script server (port 50002)** to open — that means the
    driver is ready for the robot to connect back.
 5. Opens the dashboard again and does `load /programs/uv_external_control.urp`
@@ -161,13 +162,7 @@ Step by step, this script:
 
 When you see **"Ready to receive commands"**, the robot is listening.
 
-### Terminal 2: `kill -9 $(pgrep -f ".../ur10e_teleop_controller")`
-
-Kills the legacy controller node that the launch spawned (step 3). The driver and
-everything else keep running. Without this, two nodes publish conflicting joint
-commands to the robot.
-
-### Terminal 3: `ros2 run q2r2_bringup ur10e_proximity_teleop -p sim_mode:=false ...`
+### Terminal 2: `ros2 run q2r2_bringup ur10e_proximity_teleop -p sim_mode:=false ...`
 
 Starts **the brain**. On startup it:
 - builds the IK chain (Part 5a),
@@ -196,8 +191,7 @@ flowchart TD
         A4 --> A5["dashboard: play External Control .urp<br/>→ robot connects BACK, driver streams URScript"]
     end
 
-    BRINGUP --> KILL["2 — kill legacy ur10e_teleop_controller<br/><i>(so only our node commands the robot)</i>"]
-    KILL --> RUN["3 — ros2 run ur10e_proximity_teleop (HW)<br/>subscribes /joint_states · owns /go_home · starts IDLE"]
+    BRINGUP --> RUN["2 — ros2 run ur10e_proximity_teleop (HW)<br/>subscribes /joint_states · owns /go_home · starts IDLE"]
 
     RUN --> CHOICE{"what you do"}
     CHOICE -->|call /go_home| HOMING["HOMING<br/>ramp joints → UR_HOME @ 8°/s"]
@@ -369,12 +363,10 @@ ROS_DOMAIN_ID=69 ros2 run ros_tcp_endpoint default_server_endpoint \
 # T1 — power on + driver + External Control
 cd ~/projects/LearnROS2/ros2_ws/src/Quest2ROS2
 ROS_DOMAIN_ID=69 ./scripts/ur10e_start.sh        # wait "Ready to receive commands"
-# T2 — kill the legacy controller (driver survives)
-kill -9 $(pgrep -f "q2r2_bringup/lib/q2r2_bringup/ur10e_teleop_controller")
-# T3 — the brain
+# T2 — the brain
 source ~/projects/LearnROS2/ros2_ws/install/setup.bash
 ROS_DOMAIN_ID=69 ros2 run q2r2_bringup ur10e_proximity_teleop --ros-args -p sim_mode:=false -p scale_factor:=0.5
-# T4 — home first (endpoint for the Quest is already running from T1)
+# T3 — home first (endpoint for the Quest is already running from T1)
 ROS_DOMAIN_ID=69 ros2 service call /go_home std_srvs/srv/Trigger
 # then connect Quest to <PC-ip>:10000, press A, move slowly
 ```
@@ -392,8 +384,9 @@ ROS_DOMAIN_ID=69 ros2 service call /go_home std_srvs/srv/Trigger
    pointed at the right PC IP? `ros2 topic hz /q2r_right_hand_pose`.
 4. **Changed a param but nothing happened?** Did you change *source* (needs
    restart) or a *param* (live)? Did you re-press A to re-anchor?
-5. **Two things fighting for the robot?** Did the legacy controller get killed?
-   `ros2 node list | grep teleop_controller`.
+5. **Two things fighting for the robot?** Make sure only one `ur10e_proximity_teleop`
+   is running and nothing else publishes to the command topic:
+   `ros2 topic info /forward_position_controller/commands` (Publisher count should be 1).
 
 ---
 
