@@ -139,6 +139,73 @@ single most important difference between the two modes.
 
 ---
 
+## Part 3½ — How the robot receives motion (controllers & message types)
+
+A common question: *what exactly does the robot get — a list of points? a
+trajectory? raw angles?* The answer depends on **which controller is active**, and
+it matters a lot for smoothness (and for the control-box noise we chased down).
+
+### The chain, bottom to top
+
+```
+your node ──(a ROS message)──▶ a controller ──▶ ur_robot_driver ──(URScript @ 500 Hz)──▶ robot
+```
+
+- **`controller_manager`** runs inside `ur_robot_driver` at ~**500 Hz**.
+- At any instant **one** controller "owns" the 6 joints' *position command
+  interface* — so the position controllers below are **mutually exclusive** (you
+  switch between them with `ros2 control switch_controllers`).
+- Whatever that controller outputs each 500 Hz cycle, the driver turns into a
+  URScript `servoj` and sends it to the robot over the External Control socket.
+  **The robot itself always receives a stream of joint-position setpoints at
+  ~500 Hz** — the difference is *how those 500 Hz setpoints are produced*.
+
+### The controllers you can use (the important two)
+
+| Controller | You send it | Message type | How it produces the 500 Hz stream |
+|---|---|---|---|
+| **`forward_position_controller`** | **one snapshot** of 6 target joint angles, repeatedly | `std_msgs/Float64MultiArray` (6 floats, radians) on `/forward_position_controller/commands` | **No interpolation.** It just repeats the *last* value you sent every cycle (zero-order hold). New value → instant step. |
+| **`scaled_joint_trajectory_controller`** | **a trajectory** = a list of timed waypoints | `trajectory_msgs/JointTrajectory` (or the `control_msgs/FollowJointTrajectory` **action**) on `/scaled_joint_trajectory_controller/joint_trajectory` | **Interpolates** smoothly between your waypoints at 500 Hz, and *scales* timing to the pendant speed slider. Smooth current. |
+
+A `JointTrajectory` waypoint (`JointTrajectoryPoint`) carries `positions[]`,
+optional `velocities[]` / `accelerations[]`, and a `time_from_start` — i.e. "be at
+these angles at this time." The controller fills in everything between two waypoints.
+
+Other controllers the UR driver also loads (we don't use them for teleop):
+`forward_velocity_controller` (`Float64MultiArray` of joint *velocities*),
+the non-scaled `joint_trajectory_controller`, plus broadcasters
+(`joint_state_broadcaster`, `speed_scaling_state_broadcaster`,
+`force_torque_sensor_broadcaster`) and `io_and_status_controller`. List what's
+loaded any time with `ros2 control list_controllers`.
+
+### So: snapshot vs. trajectory
+
+- **`forward_position_controller` = "go to these 6 angles, now."** No timing, no path.
+  Smoothness is entirely *your* job — you stream a fresh snapshot every tick and the
+  robot zero-order-holds between them. Great for low-latency teleop where you don't
+  know the future; rough on the drives because each tick is a step.
+- **`scaled_joint_trajectory_controller` = "follow this timed path."** You hand it the
+  whole motion (or short segments) and it interpolates. This is what **MoveIt**,
+  pendant point-to-point, and jogging use — MoveIt only *plans* the waypoints, then
+  executes them through this controller via the `FollowJointTrajectory` action.
+
+### What this project actually uses
+
+| Path | Controller | Message it sends | Notes |
+|---|---|---|---|
+| **Teleop** (hand → robot) | `forward_position_controller` | `Float64MultiArray`, 6 angles, **every 30 Hz tick** | snapshot stream, zero-order hold |
+| **`/go_home` service** | `forward_position_controller` | same `Float64MultiArray`, self-generated slow ramp | **same path as teleop** — just internally-generated targets, not from the hand |
+| **`controller_sound_test.py`** (diagnostic) | `scaled_joint_trajectory_controller` | `FollowJointTrajectory` action (timed waypoints) | the smooth/MoveIt path, for comparison |
+
+> **Why this matters for the noise:** because teleop *and* `/go_home` both stream
+> snapshots to `forward_position_controller` at 30 Hz, the robot gets a fresh step
+> every 33 ms and the drives chase each step — a ~30 Hz train of current pulses,
+> loudest on the heavy base/shoulder joints. `scaled_joint_trajectory_controller`
+> interpolates at 500 Hz, so there's no 30 Hz pulse. That's the core trade-off:
+> snapshot streaming is simplest and lowest-latency, trajectory following is smoothest.
+
+---
+
 ## Part 4 — What actually happens in the two HW terminal commands
 
 ### Terminal 1: `ROS_DOMAIN_ID=69 ./scripts/ur10e_start.sh`
