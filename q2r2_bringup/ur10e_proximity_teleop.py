@@ -165,6 +165,7 @@ class UR10eProximityTeleop(Node):
         # Sanity guard: a single-tick raw IK jump bigger than this means an
         # IK/singularity flip (not real motion) — hold rather than chase it.
         self.declare_parameter('max_ik_jump',          1.0)
+        self.declare_parameter('sync_rate_limit',      True)   # scale all joints together (quiet) vs per-joint clip (staggered)
         # Output smoothing — exponential moving average (1st-order low-pass).
         # published = alpha*raw + (1-alpha)*previous. 1.0 = off (raw, jittery),
         # lower = smoother (less tremor/noise, slightly more lag). Live-tunable.
@@ -185,6 +186,7 @@ class UR10eProximityTeleop(Node):
         self.rate       = self.get_parameter('publish_rate').value
         self.max_delta  = self.get_parameter('max_joint_delta').value
         self.max_ik_jump = self.get_parameter('max_ik_jump').value
+        self.sync_rl    = bool(self.get_parameter('sync_rate_limit').value)
         self.smooth_a   = float(self.get_parameter('smoothing_alpha').value)
         self.fail_max   = self.get_parameter('disengage_fail_count').value
         home_deg_s      = self.get_parameter('home_speed_deg_s').value
@@ -286,20 +288,29 @@ class UR10eProximityTeleop(Node):
 
     # ── Homing step (one tick toward UR_HOME) ────────────────────────────
     def _step_homing(self):
-        done = True
-        for nm in self.joint_names:
-            target  = UR_HOME.get(nm, 0.0)
-            current = self.current_joints[nm]
-            diff    = target - current
-            if abs(diff) < 1e-4:
-                self.current_joints[nm] = target
-            else:
-                step = np.clip(diff, -self.home_step, self.home_step)
-                self.current_joints[nm] = current + step
-                done = False
-        if done:
+        diffs = {nm: UR_HOME.get(nm, 0.0) - self.current_joints[nm]
+                 for nm in self.joint_names}
+        max_diff = max(abs(d) for d in diffs.values())
+        if max_diff < 1e-4:
+            for nm in self.joint_names:
+                self.current_joints[nm] = UR_HOME.get(nm, 0.0)
             self.state = IDLE
             self.get_logger().info('[go_home] Reached home position.')
+            return
+        if self.sync_rl:
+            # synchronized: farthest joint moves at home_step, the rest scale so
+            # all finish together — no staggered per-joint snaps (quiet).
+            f = min(1.0, self.home_step / max_diff)
+            for nm in self.joint_names:
+                self.current_joints[nm] += diffs[nm] * f
+        else:
+            # legacy: every joint at home_step, unsynchronized finish + snap
+            for nm in self.joint_names:
+                d = diffs[nm]
+                if abs(d) < 1e-4:
+                    self.current_joints[nm] = UR_HOME.get(nm, 0.0)
+                else:
+                    self.current_joints[nm] += float(np.clip(d, -self.home_step, self.home_step))
 
     # ── FK helper ────────────────────────────────────────────────────────
     def _fk(self):
@@ -356,6 +367,11 @@ class UR10eProximityTeleop(Node):
                 self.get_logger().info(
                     f'[smoothing_alpha] -> {a} '
                     f'({"off" if a >= 1.0 else "smoothing on"})')
+            elif p.name == 'sync_rate_limit':
+                self.sync_rl = bool(p.value)
+                self.get_logger().info(
+                    f'[sync_rate_limit] -> {self.sync_rl} '
+                    f'({"synchronized" if self.sync_rl else "per-joint clip (legacy)"})')
         return SetParametersResult(successful=True)
 
     # ── Services ─────────────────────────────────────────────────────────
@@ -484,10 +500,23 @@ class UR10eProximityTeleop(Node):
                     # target. Fast hand moves make the robot TRAIL smoothly and
                     # catch up — no violating step, no disengage.
                     self.fail_count = 0
-                    for idx, nm in zip(self.active_idx, self.joint_names):
-                        step = float(ik[idx]) - self.current_joints[nm]
-                        step = float(np.clip(step, -self.max_delta, self.max_delta))
-                        self.current_joints[nm] += step
+                    steps = {nm: float(ik[idx]) - self.current_joints[nm]
+                             for idx, nm in zip(self.active_idx, self.joint_names)}
+                    if self.sync_rl:
+                        # synchronized: scale ALL joints by one factor so the most-
+                        # constrained hits max_delta and the rest scale with it →
+                        # joints move/stop together (no staggered per-joint snaps,
+                        # which cause control-box current transients / clicking).
+                        max_step = max(abs(s) for s in steps.values())
+                        if max_step > self.max_delta:
+                            f = self.max_delta / max_step
+                            steps = {nm: s * f for nm, s in steps.items()}
+                    else:
+                        # legacy: clip each joint independently (staggered stops)
+                        steps = {nm: float(np.clip(s, -self.max_delta, self.max_delta))
+                                 for nm, s in steps.items()}
+                    for nm, s in steps.items():
+                        self.current_joints[nm] += s
 
             except Exception as e:
                 self.get_logger().warning(f'[IK] {e}')
