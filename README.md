@@ -1,11 +1,96 @@
-# Quest 2 → Yaskawa HC10DTP — Native ROS 2 VR Teleoperation
+# Quest 2 → Robot VR Teleoperation + LeRobot Data Collection (ROS 2)
 
-Real-time teleoperation of a **Yaskawa HC10DTP** 6-axis collaborative robot using **Meta Quest 2** VR controllers, running **100% natively on ROS 2 Humble** (Ubuntu 22.04). No ROS 1 bridge, no Docker — the host PC talks directly to the robot's YRC1000micro cabinet via [MotoROS2](https://github.com/Yaskawa-Global/motoros2).
+Real-time VR teleoperation of 6-axis robots from **Meta Quest 2** controllers, running **100% natively on ROS 2 Humble** (Ubuntu 22.04) — no ROS 1 bridge, no Docker. Hand poses stream at 30 Hz, IK is solved locally, and motion is gated by a clutch (deadman) plus software safety clamps.
 
-The system streams hand poses at 30 Hz, solves IK locally in ~7 ms with `ikpy`, and is gated by a clutch (deadman) plus two independent software safety clamps.
+The **current, active** platform is a **Universal Robots UR10e** driven through `forward_position_controller`, used to **record [LeRobot](https://github.com/huggingface/lerobot) demonstration datasets** (wrist + scene cameras + joint state/action) for training manipulation policies (ACT / Diffusion / VLA / World-Action-Models). See **[Data Collection: UR10e + LeRobot](#data-collection-ur10e--lerobot-active)** below — that's the part you want if you're here to collect data.
 
-> Status: **simulation pipeline fully verified end-to-end** (2026-06-10). Hardware bring-up pending — see [Running on the real robot](#3-running-on-the-real-robot).
-> Implementation plan & verification log: [HC10DTP_TELEOP_PLAN.md](./HC10DTP_TELEOP_PLAN.md).
+> **Active:** UR10e VR-teleop data collection (this README's data-collection section).
+> **Paused:** the original **Yaskawa HC10DTP** native-MotoROS2 teleop — sim pipeline verified 2026-06-10, hardware bring-up shelved. Its full write-up is preserved further down ([Architecture](#architecture) onward) and in [HC10DTP_TELEOP_PLAN.md](./HC10DTP_TELEOP_PLAN.md).
+
+---
+
+## Data Collection: UR10e + LeRobot (active)
+
+Teleoperate the UR10e with the Quest 2 **right** controller and record synchronized demonstrations as a LeRobot dataset. Each frame captures a **wrist camera** (Intel RealSense D435i, color + aligned depth), a **scene camera** (LUCID Triton GigE), the robot **state** (6 joint positions + end-effector pose) and the **action** (commanded joint targets). The left controller drives recording (start / stop / discard) so your right hand never leaves the robot.
+
+### The 3-terminal workflow
+
+Everything runs at `ROS_DOMAIN_ID=69` (terminals here auto-export it). Cameras + the LeRobot recorder are now bundled into **one** launcher (`record_session.sh`), so data collection is **3 terminals**, not 5.
+
+```bash
+# ── Terminal 1 — robot bring-up (driver + forward_position_controller + Quest TCP endpoint) ──
+~/projects/LearnROS2/ros2_ws/src/Quest2ROS2/scripts/ur10e_start.sh
+#   Powers the robot, releases brakes, launches the UR driver, then plays the
+#   External Control URCap. Wait for the driver to report it's receiving commands.
+#   (On the pendant: make sure the robot is in Remote mode.)
+
+# ── Terminal 2 — the teleop "brain" (Quest → IK → joint commands) ──
+ros2 run q2r2_bringup ur10e_proximity_teleop --ros-args -p sim_mode:=false
+#   ⚠ ALWAYS pass `-p sim_mode:=false` — the node DEFAULTS to sim_mode:=true,
+#   which publishes a 2nd /joint_states and makes RViz "glitch" without moving
+#   the real robot. Start with -p scale_factor:=0.5 for a first session.
+
+# ── Terminal 3 — both cameras + the LeRobot recorder ──
+~/projects/LearnROS2/ros2_ws/src/Quest2ROS2/scripts/record_session.sh "open the fuel door" fuel_door
+#   Launches the D435i (aligned depth ON), the LUCID camera, waits until every
+#   stream is actually publishing, then starts the recorder. The 2nd arg is the
+#   dataset folder name under ~/lerobot_datasets/. Close ArenaView first (a GigE
+#   camera allows only one controlling app).
+```
+
+Usage of the recorder launcher:
+
+```
+record_session.sh "<task description>" [dataset_name] [extra recorder args]
+```
+- **`"<task description>"`** — the natural-language label stored on every frame (used by language-conditioned policies). Keep it consistent within a dataset.
+- **`dataset_name`** — the folder under `~/lerobot_datasets/`. **Reusing a name appends** more episodes to that dataset (it prints `APPENDING episodes`); a new name starts a fresh one. One dataset per task, e.g. `fuel_door`, `charge_plug`.
+
+### Recording an episode (left controller)
+
+The teleop node owns all buttons and is the single source of truth; the recorder just follows its `/episode_event` + `/record_active` signals.
+
+| Control | Action |
+|---|---|
+| **Right A** | clutch / anchor — teleop only moves the robot while engaged; re-anchors on every engage (no jump) |
+| **Right B** | start / stop the current episode |
+| **Left X** | discard the current episode (mistake — nothing is saved) |
+| **Left Y** | e-stop (disengage + discard the open episode) |
+
+On **stop**, the episode is encoded from RAM to disk (video + parquet + depth PNGs) — you'll hear *"Encoding episode N… saved."* Because each episode lives in RAM until saved, keep **sessions** long but individual **episodes** short (≈ tens of seconds); save often.
+
+### Inspecting episodes (Rerun)
+
+Confirm the cameras **and** the motor recordings (state/action) look right:
+
+```bash
+~/projects/LearnROS2/ros2_ws/src/Quest2ROS2/scripts/viz_episode.sh 50 fuel_door
+```
+Opens the Rerun viewer for episode 50: both camera streams plus timeseries plots of `observation.state` (13) and `action` (6). The `action` traces should closely shadow the joint-position traces — tight tracking = clean teleop data.
+
+### Recovering after a crash / power-loss
+
+LeRobot keeps one parquet writer open for the whole session and only writes the file **footer** on a clean close, so a crash mid-session leaves the current `file-NNN.parquet` (data + meta) full of intact episodes but **unreadable** (`Parquet magic bytes not found in footer`). **The episodes are not lost.** Recover them:
+
+```bash
+# back up first (small — skip videos)
+cp -a ~/lerobot_datasets/<task>/{meta,data,depth} /some/backup/
+
+# dry-run scan, then repair (saves each original as *.corrupt.bak)
+~/lerobot_venv/bin/python ~/projects/LearnROS2/ros2_ws/src/Quest2ROS2/scripts/recover_truncated_parquet.py ~/lerobot_datasets/<task>
+~/lerobot_venv/bin/python ~/projects/LearnROS2/ros2_ws/src/Quest2ROS2/scripts/recover_truncated_parquet.py ~/lerobot_datasets/<task> --apply
+```
+It rebuilds the missing footer from the page stream (cloning the schema from an intact sibling file) and self-validates before touching anything. Then just re-run `record_session.sh` with the same dataset name to resume — new episodes go into a fresh file and never touch the recovered one. (Recovered all 96 episodes after a real crash, zero loss.)
+
+### Where the data lives / storage
+
+- **Local:** `~/lerobot_datasets/<dataset_name>/` (video under `videos/`, state+action under `data/`, 16-bit depth PNGs under `depth/`, metadata under `meta/`). This is what `record_session.sh` writes and what training reads.
+- **Company server (target):** datasets are to be archived/versioned to the lab server at **`10.0.0.78:8444`**. ⚠️ Upload step is **TODO / unverified** — confirm the host, port and protocol (lakeFS?) before relying on it; only the local copy is authoritative today.
+
+### Camera setup notes
+
+- **RealSense D435i (wrist):** standard `realsense2_camera`; `record_session.sh` launches it with `align_depth.enable:=true` at `640x480` (aligned depth follows). Missing `align_depth` is the classic cause of 0-frame "missing depth" episodes.
+- **LUCID Triton (scene):** a raw GigE Vision (PoE) camera bridged into ROS via a custom `arena_api` node (`scripts/lucid_camera_node.py`, launched by `scripts/lucid_camera_start.sh`). It runs in `~/lucid_venv` and publishes `/lucid/image_raw`. ArenaView **must be closed** before the node can open the camera. Full setup quirks are documented in the script headers.
 
 ---
 

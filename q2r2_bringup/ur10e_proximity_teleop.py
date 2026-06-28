@@ -40,7 +40,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import Point, PoseStamped
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Bool, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 from quest2ros.msg import OVR2ROSInputs
@@ -60,7 +60,7 @@ _NAME   = {IDLE: 'IDLE', ENGAGED: 'ENGAGED', HOMING: 'HOMING'}
 # ── Saved home pose (jogged on pendant 2026-06-16) ─────────────────────────
 # Base 0°, Shoulder -90°, Elbow 145°, Wrist1 -55°, Wrist2 90°, Wrist3 0°
 UR_HOME = {
-    'shoulder_pan_joint':  0.0,
+    'shoulder_pan_joint':  1.5708,   # base at 90° (new home, 2026-06-23)
     'shoulder_lift_joint': -1.5708,
     'elbow_joint':          2.5307,
     'wrist_1_joint':       -0.9599,
@@ -116,6 +116,14 @@ def _quat_to_mat(q):
     ])
 
 
+def _rot_z(theta):
+    """Rotation about base +Z (vertical) by theta radians — the operator-frame yaw."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s, 0.0],
+                     [s,  c, 0.0],
+                     [0.0, 0.0, 1.0]])
+
+
 def _derive_chain_spec(urdf_xml, base='base_link', tip='tool0'):
     root = ET.fromstring(urdf_xml)
     children: dict = {}
@@ -155,13 +163,13 @@ class UR10eProximityTeleop(Node):
 
         # ── Parameters ──────────────────────────────────────────────────
         self.declare_parameter('sim_mode',             True)
-        self.declare_parameter('scale_factor',         1.0)
+        self.declare_parameter('scale_factor',         0.5)
         self.declare_parameter('publish_rate',         30.0)
         # Per-tick joint rate limit (rad/tick). IK steps are CLAMPED to this so
         # fast hand moves make the robot trail smoothly & catch up — instead of
         # sending a violating step or disengaging. At publish_rate Hz the joint
         # speed cap is max_joint_delta * publish_rate rad/s.
-        self.declare_parameter('max_joint_delta',      0.05)
+        self.declare_parameter('max_joint_delta',      0.04)
         # Sanity guard: a single-tick raw IK jump bigger than this means an
         # IK/singularity flip (not real motion) — hold rather than chase it.
         self.declare_parameter('max_ik_jump',          1.0)
@@ -169,7 +177,7 @@ class UR10eProximityTeleop(Node):
         # Output smoothing — exponential moving average (1st-order low-pass).
         # published = alpha*raw + (1-alpha)*previous. 1.0 = off (raw, jittery),
         # lower = smoother (less tremor/noise, slightly more lag). Live-tunable.
-        self.declare_parameter('smoothing_alpha',      0.5)
+        self.declare_parameter('smoothing_alpha',      0.2)
         self.declare_parameter('disengage_fail_count', 15)
         self.declare_parameter('home_speed_deg_s',     8.0)   # °/s toward home
         # Position + orientation axis maps (Quest -> robot), tunable live.
@@ -178,6 +186,10 @@ class UR10eProximityTeleop(Node):
         self.declare_parameter('ori_axis_map',         'x,y,z')
         # World-frame: TCP mirrors hand rotation in the room (recommended).
         self.declare_parameter('world_frame_ori',      True)
+        # Operator ("user") frame: rotate the hand→robot mapping about vertical so
+        # "forward" tracks where you sit. Captured at each engage. Default OFF.
+        self.declare_parameter('operator_yaw_from_base', True)   # yaw = shoulder_pan at engage (default on)
+        self.declare_parameter('operator_yaw_deg',       0.0)    # manual offset (added)
         self.declare_parameter('joint_states_topic',   '/joint_states')
         self.declare_parameter('fwd_pos_topic',        '/forward_position_controller/commands')
 
@@ -198,6 +210,9 @@ class UR10eProximityTeleop(Node):
         self.R_pos      = self._safe_parse(self.get_parameter('pos_axis_map').value, 'x,y,z')
         self.R_ori      = self._safe_parse(self.get_parameter('ori_axis_map').value, 'x,y,z')
         self.world_frame = self.get_parameter('world_frame_ori').value
+        self.op_yaw_from_base = bool(self.get_parameter('operator_yaw_from_base').value)
+        self.op_yaw_deg       = float(self.get_parameter('operator_yaw_deg').value)
+        self.op_R             = np.eye(3)   # operator-frame rotation, set at engage
         self.add_on_set_parameters_callback(self._on_param_change)
 
         # ── IK chain ────────────────────────────────────────────────────
@@ -220,23 +235,26 @@ class UR10eProximityTeleop(Node):
         self.last_quest_msg = None
         self.js_received    = self.sim_mode   # sim: current_joints already valid
 
-        # A / B button edge detection
-        self.a_prev    = False
-        self.b_prev    = False
-        self.a_pressed = False
-        self.b_pressed = False
+        # Button edge detection — right: A=lower, B=upper; left: X=lower, Y=upper
+        self.a_prev = self.b_prev = self.x_prev = self.y_prev = False
+        self.a_pressed = self.b_pressed = self.x_pressed = self.y_pressed = False
+        self.episode_active = False   # an episode is open (recording or paused)
 
         # ── Subscriptions ───────────────────────────────────────────────
         self.create_subscription(
             PoseStamped, '/q2r_right_hand_pose', self._quest_pose_cb, 10)
         self.create_subscription(
             OVR2ROSInputs, '/q2r_right_hand_inputs', self._inputs_cb, 10)
+        self.create_subscription(
+            OVR2ROSInputs, '/q2r_left_hand_inputs', self._left_inputs_cb, 10)
         if not self.sim_mode:
             self.create_subscription(
                 JointState, js_topic, self._joint_state_cb, qos_profile_sensor_data)
 
         # ── Publishers ──────────────────────────────────────────────────
         self.marker_pub = self.create_publisher(MarkerArray, '/teleop_markers', 10)
+        self.record_pub = self.create_publisher(Bool, '/record_active', 10)
+        self.event_pub  = self.create_publisher(String, '/episode_event', 10)
         if self.sim_mode:
             self.js_pub = self.create_publisher(JointState, js_topic, 10)
         else:
@@ -279,11 +297,11 @@ class UR10eProximityTeleop(Node):
         """
         if self.world_frame:
             R_rel_world = q_rot @ self.quest_rot_anchor.T          # extrinsic
-            R_rel_rob   = self.R_ori @ R_rel_world @ self.R_ori.T
+            R_rel_rob   = self.op_R @ (self.R_ori @ R_rel_world @ self.R_ori.T) @ self.op_R.T
             return R_rel_rob @ self.rot_anchor
         else:
             R_rel     = self.quest_rot_anchor.T @ q_rot            # intrinsic
-            R_rel_rob = self.R_ori @ R_rel @ self.R_ori.T
+            R_rel_rob = self.op_R @ (self.R_ori @ R_rel @ self.R_ori.T) @ self.op_R.T
             return self.rot_anchor @ R_rel_rob
 
     # ── Homing step (one tick toward UR_HOME) ────────────────────────────
@@ -372,6 +390,14 @@ class UR10eProximityTeleop(Node):
                 self.get_logger().info(
                     f'[sync_rate_limit] -> {self.sync_rl} '
                     f'({"synchronized" if self.sync_rl else "per-joint clip (legacy)"})')
+            elif p.name == 'operator_yaw_from_base':
+                self.op_yaw_from_base = bool(p.value)
+                self.get_logger().info(
+                    f'[operator_yaw_from_base] -> {self.op_yaw_from_base} (applies on next engage)')
+            elif p.name == 'operator_yaw_deg':
+                self.op_yaw_deg = float(p.value)
+                self.get_logger().info(
+                    f'[operator_yaw_deg] -> {self.op_yaw_deg} (applies on next engage)')
         return SetParametersResult(successful=True)
 
     # ── Services ─────────────────────────────────────────────────────────
@@ -405,6 +431,40 @@ class UR10eProximityTeleop(Node):
         self.a_prev = a_now
         self.b_prev = b_now
 
+    def _left_inputs_cb(self, msg: OVR2ROSInputs):
+        x_now = bool(msg.button_lower)   # left X
+        y_now = bool(msg.button_upper)   # left Y
+        if x_now and not self.x_prev:
+            self.x_pressed = True
+        if y_now and not self.y_prev:
+            self.y_pressed = True
+        self.x_prev = x_now
+        self.y_prev = y_now
+
+    def _emit_event(self, name):
+        m = String(); m.data = name
+        self.event_pub.publish(m)
+
+    def _engage(self, q_pos, tcp_pos, tcp_rot, q_rot):
+        self.state            = ENGAGED
+        self.quest_anchor     = q_pos.copy()
+        self.tcp_anchor       = tcp_pos.copy()
+        self.rot_anchor       = tcp_rot.copy()
+        self.quest_rot_anchor = q_rot.copy()
+        self.fail_count       = 0
+        self.cmd_filtered     = None   # re-seed smoothing on engage
+        # operator-frame yaw: track where you sit (base heading) + manual offset
+        yaw = np.radians(self.op_yaw_deg)
+        if self.op_yaw_from_base:
+            yaw += float(self.current_joints['shoulder_pan_joint'])
+        self.op_R = _rot_z(yaw)
+        self.get_logger().info(
+            f'[engage] operator yaw = {np.degrees(yaw):.1f}° '
+            f'(from_base={self.op_yaw_from_base}, manual={self.op_yaw_deg}°)')
+
+    def _disengage(self):
+        self.state = IDLE
+
     def _joint_state_cb(self, msg: JointState):
         # While we are actively driving the robot (ENGAGED or HOMING) we own
         # current_joints — don't let feedback overwrite the commanded trajectory.
@@ -420,12 +480,26 @@ class UR10eProximityTeleop(Node):
         tcp_pos, tcp_rot = self._fk()
         prev_state = self.state
 
-        # Handle B (emergency stop) — always processed
-        if self.b_pressed:
-            self.b_pressed = False
+        # Recording-active = engaged AND an episode is open. Published every tick;
+        # the recorder captures a frame only while this is True (clutch-out pauses).
+        ra = Bool(); ra.data = (self.state == ENGAGED and self.episode_active)
+        self.record_pub.publish(ra)
+
+        # ── Left Y = e-stop (discards an open episode); X = discard ────────
+        if self.y_pressed:
+            self.y_pressed = False
+            if self.episode_active:
+                self._emit_event('discard'); self.episode_active = False
             if self.state in (ENGAGED, HOMING):
-                self.state = IDLE
-                self.get_logger().info('[B] Emergency stop → IDLE')
+                self._disengage()
+            self.get_logger().warn('[Y] EMERGENCY STOP → IDLE (episode discarded)')
+        if self.x_pressed:
+            self.x_pressed = False
+            if self.episode_active:
+                self._emit_event('discard'); self.episode_active = False
+                if self.state == ENGAGED:
+                    self._disengage()
+                self.get_logger().info('[X] episode discarded')
 
         # ── Homing runs independently of the Quest (no headset needed) ────
         if self.state == HOMING:
@@ -449,27 +523,38 @@ class UR10eProximityTeleop(Node):
                   msg.pose.orientation.z, msg.pose.orientation.w]
         q_rot  = _quat_to_mat(q_quat)
 
-        # Handle A (toggle engage/disengage)
+        # Handle A (clutch): engage/disengage. During an episode = resume/pause.
         if self.a_pressed:
             self.a_pressed = False
             if self.state == IDLE:
-                self.state            = ENGAGED
-                self.quest_anchor     = q_pos.copy()
-                self.tcp_anchor       = tcp_pos.copy()
-                self.rot_anchor       = tcp_rot.copy()
-                self.quest_rot_anchor = q_rot.copy()
-                self.fail_count       = 0
-                self.cmd_filtered     = None   # re-seed smoothing on engage
+                self._engage(q_pos, tcp_pos, tcp_rot, q_rot)
                 self.get_logger().info(
-                    f'[A] ENGAGED — anchor TCP: {np.round(tcp_pos, 3)}')
+                    f'[A] ENGAGED — anchor TCP: {np.round(tcp_pos, 3)}'
+                    + ('  (resume)' if self.episode_active else ''))
             else:
-                self.state = IDLE
-                self.get_logger().info('[A] IDLE')
+                self._disengage()
+                self.get_logger().info(
+                    '[A] IDLE' + ('  (pause)' if self.episode_active else ''))
+
+        # Handle B (clutch): start / stop an episode — also anchors.
+        if self.b_pressed:
+            self.b_pressed = False
+            if not self.episode_active:
+                if self.state != ENGAGED:
+                    self._engage(q_pos, tcp_pos, tcp_rot, q_rot)
+                self.episode_active = True
+                self._emit_event('start')
+                self.get_logger().info('[B] START episode')
+            else:
+                self._emit_event('save')
+                self.episode_active = False
+                self._disengage()
+                self.get_logger().info('[B] STOP + save episode')
 
         # ── IK when ENGAGED ──────────────────────────────────────────────
         if self.state == ENGAGED:
             delta_q    = q_pos - self.quest_anchor
-            target_pos = self.tcp_anchor + self.R_pos @ delta_q * self.scale
+            target_pos = self.tcp_anchor + self.op_R @ (self.R_pos @ delta_q) * self.scale
 
             target_rot = self._map_rotation(q_rot)
 

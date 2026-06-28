@@ -21,9 +21,13 @@ ros2 param set /ur10e_proximity_teleop smoothing_alpha 0.5
 
 | Knob | What it does | Safe range | Default |
 |---|---|---|---|
-| `scale_factor` | reach — robot motion per unit of hand motion | 0.5–2.0 | 1.0 |
-| `max_joint_delta` | per-tick joint speed cap (×30 ≈ rad/s); clamps fast moves so the robot trails & catches up instead of protective-stopping | ≤ 0.07 | 0.05 |
-| `smoothing_alpha` | EMA low-pass on the command — kills jitter; `1.0` = off, lower = smoother but more lag | 0.25–1.0 | 0.5 |
+| `scale_factor` | reach — robot motion per unit of hand motion | 0.5–2.0 | 0.5 |
+| `max_joint_delta` | per-tick joint speed cap (×30 ≈ rad/s); clamps fast moves so the robot trails & catches up instead of protective-stopping | ≤ 0.07 | 0.04 |
+| `smoothing_alpha` | EMA low-pass on the command — kills jitter; `1.0` = off, lower = smoother but more lag | 0.1–1.0 | 0.2 |
+
+> Defaults updated 2026-06-23 to the values that felt best on the real robot
+> (`scale_factor 0.5`, `max_joint_delta 0.04`, `smoothing_alpha 0.2`) — so teleop
+> starts ready without any `-p` overrides.
 
 ## "Very safe" tested setup
 

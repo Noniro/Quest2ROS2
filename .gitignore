@@ -6,3 +6,11 @@ q2r_bringup/__pycache__/.vs/
 # Python bytecode
 **/__pycache__/
 *.pyc
+
+# Recording runtime artifacts (not code)
+# LUCID per-camera stream-selector state, written at runtime
+scripts/persist.json
+# parquet originals saved by recover_truncated_parquet.py
+*.corrupt.bak
+# Rerun recordings
+*.rrd
