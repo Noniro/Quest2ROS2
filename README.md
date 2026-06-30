@@ -85,12 +85,65 @@ It rebuilds the missing footer from the page stream (cloning the schema from an 
 ### Where the data lives / storage
 
 - **Local:** `~/lerobot_datasets/<dataset_name>/` (video under `videos/`, state+action under `data/`, 16-bit depth PNGs under `depth/`, metadata under `meta/`). This is what `record_session.sh` writes and what training reads.
-- **Company server (target):** datasets are to be archived/versioned to the lab server at **`10.0.0.78:8444`**. ⚠️ Upload step is **TODO / unverified** — confirm the host, port and protocol (lakeFS?) before relying on it; only the local copy is authoritative today.
+- **Company server (lakeFS):** datasets are versioned to the lab **lakeFS** server (mTLS, certs in `~/certs/`) with the `lake` CLI:
+  ```bash
+  ~/lakefs-ros/venv/bin/lake push ~/lerobot_datasets/<dataset> advanced-robotic-ai data \
+      --message '<dataset>: N episodes' --extra-metadata '{"robot":"ur10e","task":"<t>","episodes":N}'
+  ```
+  It uploads → commits on the branch → merges into `main`. The branch **must already exist**; the host defaults to `10.0.0.78:8445` (don't pass `--host`). Passing `--extra-metadata` avoids a harmless `commit: no changes` error on the final metadata step. Keep the local copy until verified.
 
 ### Camera setup notes
 
 - **RealSense D435i (wrist):** standard `realsense2_camera`; `record_session.sh` launches it with `align_depth.enable:=true` at `640x480` (aligned depth follows). Missing `align_depth` is the classic cause of 0-frame "missing depth" episodes.
 - **LUCID Triton (scene):** a raw GigE Vision (PoE) camera bridged into ROS via a custom `arena_api` node (`scripts/lucid_camera_node.py`, launched by `scripts/lucid_camera_start.sh`). It runs in `~/lucid_venv` and publishes `/lucid/image_raw`. ArenaView **must be closed** before the node can open the camera. Full setup quirks are documented in the script headers.
+
+---
+
+## Evaluation: running a trained policy (UR10e)
+
+Once a policy is trained (e.g. π0 fine-tuned on a recorded dataset), evaluate it **autonomously on the robot** to get a real success rate and find failure modes. The policy drives the arm — **no teleop node, no Quest headset**; you score each trial from the laptop **keyboard**. This is the mirror of recording: `model → robot → measure` instead of `human → robot → save`.
+
+### How inference is served (over the network)
+
+This laptop has no GPU, so the model runs on a separate **GPU machine** exposing an **openpi `WebsocketPolicyServer`**. The eval node sends observations (wrist + scene image + 13-dim state) over the LAN and gets back an **action chunk** (6 joint targets × horizon), which it streams to `/forward_position_controller/commands`.
+
+- The eval node runs in **`~/eval_venv`** (has `openpi-client`) — *separate* from `~/lerobot_venv`, because openpi-client pins `numpy<2` while lerobot needs `numpy≥2`.
+- **Network:** GPU server e.g. `192.168.6.1:8000`; the laptop is dual-homed on the wired switch (`192.168.1.202` for robot/camera **+** a secondary `192.168.6.2` to reach the GPU). The server must bind **`0.0.0.0`**. The GPU box may not answer ping (ICMP firewall) — test the **port**: `nc -vz 192.168.6.1 8000`.
+- **Observation keys** are defined by the server's openpi data config — confirm them and pass `--openpi-wrist-key/--scene-key/--state-key/--prompt-key/--action-key` if the defaults don't match (the client logs server metadata on connect).
+
+### Staged test (safe → live)
+
+```bash
+# 1) Aliveness probe — NO robot, NO cameras. Validates server + obs keys + latency.
+~/eval_venv/bin/python scripts/policy_ping.py --policy-host 192.168.6.1 --policy-port 8000
+
+# 2) Dry-run — real cameras, but the robot NEVER moves (logs the action it would send).
+eval_session.sh "open the fuel door" fuel_door --policy-host 192.168.6.1 --policy-port 8000 --dry-run
+
+# 3) Live — cautious for an undertrained model; hand on the pendant e-stop.
+eval_session.sh "open the fuel door" fuel_door --policy-host 192.168.6.1 --policy-port 8000 \
+    --max-joint-step 0.04 --run-seconds 10 --trials 2
+```
+
+### Running it (2 terminals on the laptop)
+
+```bash
+# T1 — robot bring-up (driver + forward_position_controller + opens the External Control "gate")
+scripts/ur10e_start.sh                 # wait for "Ready to receive commands"; pendant in Remote mode
+
+# T2 — cameras + eval node (the bridge to the GPU). NO teleop node during eval.
+scripts/eval_session.sh "open the fuel door" fuel_door --policy-host 192.168.6.1 --policy-port 8000
+```
+
+Per trial the loop is: **auto-home → you reset the scene + press `r` → policy runs → you press `t`/`f`**. Keyboard: `r`=ready/go, `s`=stop early, `t`=success, `f`=fail. Safety: a per-tick joint-delta clamp (`--max-joint-step`) rejects wild policy outputs; the **physical pendant e-stop is the real backstop**.
+
+### Output
+
+Each session writes `~/eval_runs/<dataset>_<timestamp>/`: a `results.csv` (trial, result, seconds, video) and a per-trial `.mp4`, and prints the **success rate** + the **failed trial numbers** so you know which videos to review. Per-query latency (mean/p95/max) is logged so you can confirm the network path is fast enough.
+
+### The eval flywheel
+
+`collect → train → evaluate → mine failure modes → collect targeted demos for what fails → retrain`. Eval logs are a **diagnosis** (they tell you *what* to record next), not training data — the fix is the new targeted demos. This closed loop is what makes data collection efficient instead of "record more and hope."
 
 ---
 
