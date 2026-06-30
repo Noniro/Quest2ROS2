@@ -290,6 +290,10 @@ class PolicyEval(Node):
         step = self.args.max_joint_step
         cmd = np.clip(np.asarray(target6, float), base - step, base + step)
         self.last_cmd = cmd
+        if self.args.dry_run:
+            self.get_logger().info(f'[dry-run] would command: '
+                                   f'{np.round(cmd, 3).tolist()} (robot NOT moved)')
+            return
         self.cmd_pub.publish(Float64MultiArray(data=[float(x) for x in cmd]))
 
     def _obs(self):
@@ -324,6 +328,11 @@ class PolicyEval(Node):
             self._do_judging()
 
     def _do_homing(self):
+        if self.args.dry_run:                       # no motion in dry-run; don't wait to "reach" home
+            self.last_cmd = np.array([self.joints[n] for n in UR_JOINTS])
+            self.state = WAIT_READY
+            self.speak(f'Dry run. Press r to query the policy for trial {self.trial + 1} (robot will NOT move).')
+            return
         cur = np.array([self.joints[n] for n in UR_JOINTS])
         goal = np.array([UR_HOME[n] for n in UR_JOINTS])
         diff = goal - cur
@@ -447,6 +456,9 @@ def main():
     # safety
     p.add_argument('--max-joint-step', type=float, default=0.10, help='rad: max change per joint per tick')
     p.add_argument('--home-speed-deg-s', type=float, default=8.0)
+    p.add_argument('--dry-run', action='store_true',
+                   help='query the policy on REAL camera/joint obs but NEVER command the robot '
+                        '(logs the action it would send). Safe first test of an undertrained model.')
     # io
     p.add_argument('--input', choices=['quest', 'keyboard'], default='keyboard')
     p.add_argument('--out', default='~/eval_runs')
