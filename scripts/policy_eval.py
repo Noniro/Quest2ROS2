@@ -157,6 +157,43 @@ class LocalPolicyClient(PolicyClient):
         return act.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+class OpenPiClient(PolicyClient):
+    """Talks to an openpi WebsocketPolicyServer (Physical Intelligence's π0 serving).
+
+    Run in ~/eval_venv (openpi-client pins numpy<2, so it canNOT live in lerobot_venv).
+    openpi serializes raw numpy arrays over the wire (msgpack) — so we send the RAW RGB
+    images + state, NO jpeg encoding. client.infer(obs) -> {"actions": (horizon, 6), ...}.
+
+    ⚠️ The observation KEY NAMES are defined by the coworker's openpi data/repack config,
+    NOT by us. Defaults below are common openpi names — CONFIRM the exact keys (and image
+    size / state layout / action key) with whoever trained & serves the model. The server
+    also announces metadata on connect, which we log to help you discover the keys.
+    """
+    def __init__(self, host, port, task, keys):
+        from openpi_client import websocket_client_policy
+        self.client = websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
+        self.task = task
+        self.k = keys  # dict: wrist, scene, state, prompt, action
+        try:
+            print('[openpi] server metadata:', self.client.get_server_metadata())
+        except Exception:
+            pass
+
+    def reset(self):
+        try: self.client.reset()
+        except Exception: pass
+
+    def select_action(self, obs):
+        payload = {
+            self.k['wrist']: obs['images']['wrist'],          # raw HWC uint8 RGB
+            self.k['scene']: obs['images']['scene'],
+            self.k['state']: np.asarray(obs['state'], dtype=np.float32),
+            self.k['prompt']: self.task,
+        }
+        res = self.client.infer(payload)
+        return np.asarray(res[self.k['action']], dtype=np.float32)  # (horizon, 6) or (6,)
+
+
 # ─────────────────────────── the eval node ─────────────────────────────────
 HOMING, WAIT_READY, RUNNING, JUDGING, DONE = 'HOMING', 'WAIT_READY', 'RUNNING', 'JUDGING', 'DONE'
 
@@ -395,10 +432,18 @@ def main():
     p.add_argument('--run-seconds', type=float, default=20.0, help='max seconds per trial')
     p.add_argument('--rate', type=float, default=10.0, help='control Hz (match training fps)')
     # serving
-    p.add_argument('--serve', choices=['remote', 'local'], default='remote')
-    p.add_argument('--policy-host', default='http://10.0.0.78:9000', help='remote policy server base URL')
+    p.add_argument('--serve', choices=['openpi', 'remote', 'local'], default='openpi',
+                   help='openpi=websocket server (default); remote=plain HTTP; local=in-process')
+    p.add_argument('--policy-host', default='10.0.0.78', help='policy server host/IP')
+    p.add_argument('--policy-port', type=int, default=8000, help='policy server port (openpi default 8000)')
     p.add_argument('--checkpoint', default='', help='local LeRobot checkpoint path (--serve local)')
     p.add_argument('--device', default='cuda')
+    # openpi observation key names — CONFIRM with the coworker's openpi data config
+    p.add_argument('--openpi-wrist-key',  default='observation/wrist_image')
+    p.add_argument('--openpi-scene-key',  default='observation/image')
+    p.add_argument('--openpi-state-key',  default='observation/state')
+    p.add_argument('--openpi-prompt-key', default='prompt')
+    p.add_argument('--openpi-action-key', default='actions')
     # safety
     p.add_argument('--max-joint-step', type=float, default=0.10, help='rad: max change per joint per tick')
     p.add_argument('--home-speed-deg-s', type=float, default=8.0)
@@ -416,7 +461,12 @@ def main():
     p.add_argument('--voice-rate', type=int, default=-10)
     args = p.parse_args()
 
-    if args.serve == 'remote':
+    if args.serve == 'openpi':
+        keys = {'wrist': args.openpi_wrist_key, 'scene': args.openpi_scene_key,
+                'state': args.openpi_state_key, 'prompt': args.openpi_prompt_key,
+                'action': args.openpi_action_key}
+        policy = OpenPiClient(args.policy_host, args.policy_port, args.task, keys)
+    elif args.serve == 'remote':
         policy = RemotePolicyClient(args.policy_host, args.task)
     else:
         if not args.checkpoint:

@@ -66,5 +66,7 @@ wait_topic "$LUCID_TOPIC" "LUCID scene" || { echo "  see $LOG/lucid.log"; exit 1
 echo "[eval_session] cameras live. Starting policy evaluation."
 echo "[eval_session]   keyboard: r=ready/go  s=stop run  t=success  f=fail  (letter + Enter)"
 echo "[eval_session]   KEEP A HAND ON THE PENDANT E-STOP — the policy drives the arm."
-~/lerobot_venv/bin/python "$SCRIPTS/policy_eval.py" \
+# eval runs in ~/eval_venv (openpi-client pins numpy<2; lerobot_venv stays numpy 2).
+PY="${EVAL_PYTHON:-$HOME/eval_venv/bin/python}"
+"$PY" "$SCRIPTS/policy_eval.py" \
   --task "$TASK" --dataset "$DATASET" "$@"
